@@ -1,0 +1,558 @@
+import express from 'express';
+import dotenv from 'dotenv';
+import fs from 'fs';
+import { CharacterTextSplitter } from 'langchain/text_splitter';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+import { HumanMessage, AIMessage } from '@langchain/core/messages';
+import cors from 'cors';
+import bodyParser from 'body-parser';   
+import cookieParser from 'cookie-parser';
+import { ObjectId } from 'mongodb';
+import connectToDatabase, { userChatCollection } from './database.js';
+import { analyzeSensitiveContent } from './tracksensetiveword.js';
+import AIchatbot from "./Model/chathistory.js"
+
+// Validate MongoDB ObjectId
+function isValidObjectId(id) {
+  try {
+    return ObjectId.isValid(id);
+  } catch (error) {
+    return false;
+  }
+}
+
+dotenv.config();
+
+const app = express();
+app.use(express.json());
+
+
+connectToDatabase();
+const corsOptions = {
+  origin: "*",
+  methods: "GET,HEAD,PUT,PATCH,POST,DELETE",
+  preflightContinue: false,
+  optionsSuccessStatus: 204,
+};
+
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions)); 
+app.use(cookieParser());
+app.use(bodyParser.json({ extended: true }));
+app.use(bodyParser.urlencoded({ extended: true }));
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const PORT = process.env.PORT || 5001;
+console.log(process.env.PORT, "port number");
+
+const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+const geminiModel = genAI.getGenerativeModel({ model: "gemini-1.5-pro" });
+
+// Save chat to user history array
+
+async function saveChatToHistory(userId, query, sessionId, response, recommendations = [], sessionType = 'default') {
+  // Note: Fixed parameter order - sessionId should come before response
+  if (!isValidObjectId(userId)) {
+    console.log('Invalid userId, skipping chat history save');
+    return null;
+  }
+  
+  if (!sessionId) {
+    console.log('Session id not provided');
+    return null;
+  }
+
+  try {
+    const objectId = new ObjectId(userId);
+    
+    const chatMessage = {
+      timestamp: new Date(),
+      query,
+      response,
+      recommendations
+    };
+
+    // First, try to add message to existing session
+    const updateResult = await AIchatbot.updateOne(
+      { 
+        userId: objectId, 
+        'chat_history.sessionId': sessionId 
+      },
+      { 
+        $push: { 
+          'chat_history.$.chatMessages': chatMessage 
+        },
+        $set: {
+          'chat_history.$.updatedAt': new Date()
+        }
+      }
+    );
+
+    if (updateResult.matchedCount > 0) {
+      console.log(`Chat added to existing session ${sessionId} for user ${userId}`);
+      
+      // Process sensitive words
+      const sensitiveWordsFound = await analyzeSensitiveContent(userId, query);
+      
+      return updateResult;
+    }
+
+    // If no existing session found, create new session
+    const upsertResult = await AIchatbot.findOneAndUpdate(
+      { userId: objectId },
+      {
+        $push: { 
+          chat_history: {
+            sessionId,
+            sessionType,
+            chatMessages: [chatMessage]
+          }
+        },
+        $setOnInsert: {
+          sensitiveWords: [],
+          keyWords: []
+        }
+      },
+      { 
+        upsert: true, 
+        new: true 
+      }
+    );
+
+    console.log(`New session ${sessionId} created for user ${userId}`);
+    
+    // Process sensitive words
+    const sensitiveWordsFound = await analyzeSensitiveContent(userId, query);
+    
+    return upsertResult;
+  } catch (error) {
+    console.error('Error saving chat to history:', error);
+    return null;
+  }
+}
+
+// Get user chat history
+async function getUserChatHistory(userId, sessionId) {
+  if (!isValidObjectId(userId)) {
+    return null;
+  }
+
+  if (!sessionId) {
+    console.error('SessionId is required');
+    return null;
+  }
+
+  try {
+    const objectId = new ObjectId(userId);
+    
+    const result = await AIchatbot.aggregate([
+      {
+        $match: {
+          userId: objectId,
+          'chat_history.sessionId': sessionId
+        }
+      },
+      {
+        $unwind: '$chat_history'
+      },
+      {
+        $match: {
+          'chat_history.sessionId': sessionId
+        }
+      },
+      {
+        $project: {
+          sessionId: '$chat_history.sessionId',
+          sessionType: '$chat_history.sessionType',
+          createdAt: '$chat_history.createdAt',
+          updatedAt: '$chat_history.updatedAt',
+          messages: {
+            $map: {
+              input: '$chat_history.chatMessages',
+              as: 'message',
+              in: {
+                timestamp: '$$message.timestamp',
+                question: '$$message.query',
+                answer: '$$message.response',
+                recommendations: {
+                  $ifNull: ['$$message.recommendations', []]
+                }
+              }
+            }
+          }
+        }
+      }
+    ]);
+    
+    return result.length > 0 ? result[0] : null;
+  } catch (error) {
+    console.error('Error fetching session chat history (optimized):', error);
+    return null;
+  }
+}
+
+// Safe embedding function with improved size checking
+const embedText = async (text) => {
+  try {
+    // Get byte length of text in UTF-8
+    const byteLength = Buffer.byteLength(text, 'utf8');
+    
+    // Hard limit of 32000 bytes to be safe (below Google's 36000 byte limit)
+    const MAX_BYTES = 32000;
+    
+    // If text is too large, truncate it
+    if (byteLength > MAX_BYTES) {
+      console.warn(`Text too large for embedding (${byteLength} bytes), truncating`);
+      
+      // Truncate characters gradually until we're under the byte limit
+      let truncatedText = text;
+      while (Buffer.byteLength(truncatedText, 'utf8') > MAX_BYTES) {
+        truncatedText = truncatedText.slice(0, truncatedText.length * 0.9); // Reduce by 10% each time
+      }
+      text = truncatedText;
+    }
+    
+    const embeddingModel = genAI.getGenerativeModel({ model: "embedding-001" });
+    const result = await embeddingModel.embedContent(text);
+    return result.embedding.values;
+  } catch (error) {
+    console.error(`Embedding error: ${error.message}`);
+    throw error;
+  }
+};
+
+class Document {
+  constructor(pageContent, metadata = {}) {
+    this.pageContent = pageContent;
+    this.metadata = metadata;
+  }
+}
+
+// Load and split data from a text file
+const loadAndSplitData = async () => {
+  const filePath = './newData.txt';
+  const rawText = fs.readFileSync(filePath, 'utf-8');
+  
+  // Use a significantly smaller chunk size to avoid embedding API limits
+  const splitter = new CharacterTextSplitter({ 
+    chunkSize: 1000,     // Much smaller, well below the limit
+    chunkOverlap: 50     // Reduced overlap for less duplication
+  });
+  
+  const textChunks = await splitter.splitText(rawText);
+  
+  // Double-check chunk sizes
+  const largeChunks = textChunks.filter(chunk => 
+    Buffer.byteLength(chunk, 'utf8') > 32000
+  );
+  
+  if (largeChunks.length > 0) {
+    console.warn(`Warning: ${largeChunks.length} chunks are still over 32KB after splitting`);
+    // You could implement further splitting here if needed
+  }
+  
+  return textChunks.map(chunk => new Document(chunk));
+};
+
+// Simple vector similarity function
+const cosineSimilarity = (vecA, vecB) => {
+  const dotProduct = vecA.reduce((sum, a, i) => sum + a * vecB[i], 0);
+  const magA = Math.sqrt(vecA.reduce((sum, a) => sum + a * a, 0));
+  const magB = Math.sqrt(vecB.reduce((sum, b) => sum + b * b, 0));
+  return dotProduct / (magA * magB);
+};
+
+// Custom retriever implementation
+class CustomRetriever {
+  constructor(documents, embedFn) {
+    this.documents = documents;
+    this.embedFn = embedFn;
+    this.embeddings = [];
+  }
+
+  async initialize() {
+    // Precompute embeddings for all documents
+    console.log(`Starting embedding computation for ${this.documents.length} documents...`);
+    let successCount = 0;
+    let errorCount = 0;
+    
+    for (const doc of this.documents) {
+      try {
+        // Make sure document isn't too large before embedding
+        const pageContent = doc.pageContent;
+        const byteLength = Buffer.byteLength(pageContent, 'utf8');
+        
+        if (byteLength > 32000) {
+          console.warn(`Document too large (${byteLength} bytes), further chunking needed`);
+          
+          // Split the document into smaller chunks
+          const splitter = new CharacterTextSplitter({ 
+            chunkSize: 1000,  // Much smaller chunks
+            chunkOverlap: 50
+          });
+          
+          const subChunks = await splitter.splitText(pageContent);
+          // console.log(`  Split large document into ${subChunks.length} sub-chunks`);
+          
+          // Process each sub-chunk individually
+          for (const chunk of subChunks) {
+            try {
+              const embedding = await this.embedFn(chunk);
+              this.embeddings.push({ 
+                doc: new Document(chunk, doc.metadata), 
+                embedding 
+              });
+              successCount++;
+            } catch (subError) {
+              console.error(`Failed to embed sub-chunk: ${subError.message}`);
+              errorCount++;
+            }
+          }
+        } else {
+          // Process normal-sized document
+          const embedding = await this.embedFn(pageContent);
+          this.embeddings.push({ doc, embedding });
+          successCount++;
+        }
+        
+        // Log progress periodically
+        if ((successCount + errorCount) % 10 === 0) {
+          console.log(`Processed ${successCount + errorCount}/${this.documents.length} documents. Success: ${successCount}, Errors: ${errorCount}`);
+        }
+      } catch (error) {
+        console.error(`Failed to embed document: ${error.message}`);
+        errorCount++;
+      }
+    }
+    
+    console.log(`Embedding complete. Success: ${successCount}, Errors: ${errorCount}`);
+  }
+
+  async getRelevantDocuments(query, k = 3) {
+    const queryEmbedding = await this.embedFn(query);
+    
+    // Compute similarities
+    const similarities = this.embeddings.map(item => ({
+      doc: item.doc,
+      score: cosineSimilarity(queryEmbedding, item.embedding)
+    }));
+    
+    // Sort by similarity score (descending)
+    similarities.sort((a, b) => b.score - a.score);
+    
+    // Return top k documents
+    return similarities.slice(0, k).map(item => item.doc);
+  }
+}
+
+// Prompt template (customizable)
+const promptTemplate = `You are a kind and helpful assistant focused on supporting users with mental health concerns.
+
+Use the given context to respond to the user's question accurately and compassionately.
+
+**Guidelines:**
+- Use only the provided context when available. If the context is missing or unrelated, respond using general mental health knowledge in **10–20 words**.
+- Do **not** include any external contact numbers.
+- **Only mention the Tele-MANAS helpline (1-800-891-4416)** strictly in **extreme cases**, such as: suicide, self-harm, panic attack, "kill myself", "end my life", "final goodbye", or similar crisis phrases.
+- If the user greets you (e.g., "hi", "hello", "my name is..."), respond warmly and invite them to share a mental health–related question.
+- If the message is **unrelated to mental health or general life concerns**, and **not a greeting**, reply briefly:
+  **"I'm sorry, I didn't understand that. Could you please rephrase or share a bit more? I'm here to help!"**
+- Provide **2–3 suggested follow-up questions** directly related to the user's concern or the provided context. These should be specific to **mental health** and written in **4–5 words**, formatted as bullet points.
+
+**Return your final response **strictly in the following valid JSON format only:**
+
+\`\`\`json
+{
+  "answer": "Your helpful response here.",
+  "recommendations": [
+    "Follow-up suggestion 1",
+    "Follow-up suggestion 2",
+    "Follow-up suggestion 3"
+  ]
+}
+\`\`\`
+
+Context:
+{context}
+
+Chat History:
+{chat_history}
+
+User Question:
+{question}`;
+
+
+
+// Format documents into context string
+const formatDocs = (docs) => docs.map((doc) => doc.pageContent).join('\n\n');
+
+// Direct Gemini API call function
+const callGemini = async (prompt) => {
+  try {
+    const result = await geminiModel.generateContent(prompt);
+    return result.response.text();
+  } catch (error) {
+    console.error("Error calling Gemini API:", error);
+    throw error;
+  }
+};
+
+// Create a custom chain
+const createCustomChain = (retriever) => {
+  return async ({ question, chat_history }) => {
+    const context = formatDocs(await retriever.getRelevantDocuments(question));
+    
+    // Format chat history
+    let formattedHistory = "";
+    if (chat_history && chat_history.length > 0) {
+      formattedHistory = chat_history.map(msg => {
+        if (msg instanceof HumanMessage) {
+          return `Human: ${msg.content}`;
+        } else if (msg instanceof AIMessage) {
+          return `AI: ${msg.content}`;
+        }
+        return "";
+      }).join("\n");
+    }
+    
+    // Fill prompt template
+    const filledPrompt = promptTemplate
+      .replace("{context}", context)
+      .replace("{chat_history}", formattedHistory)
+      .replace("{question}", question);
+    
+    // Call Gemini directly
+    return await callGemini(filledPrompt);
+  };
+};
+
+
+
+function parseResponse(raw) {
+  const output = {
+    answer: "No answer found.",
+    recommendations: []
+  };
+
+  if (!raw) return output;
+
+  try {
+    // If it's already an object (e.g., from Gemini API)
+    if (typeof raw === "object" && raw.answer) {
+      output.answer = raw.answer;
+      output.recommendations = Array.isArray(raw.recommendations)
+        ? raw.recommendations
+        : [];
+      return output;
+    }
+
+    // If it's a string, clean up and parse
+    if (typeof raw === "string") {
+      raw = raw.trim();
+
+      // Remove markdown wrappers like ```json
+      if (raw.startsWith("```json") || raw.startsWith("```")) {
+        raw = raw.replace(/^```(?:json)?\n?/, "").replace(/```$/, "").trim();
+      }
+
+      // Parse JSON
+      const parsed = JSON.parse(raw);
+
+      // Validate keys
+      if (parsed.answer) {
+        output.answer = parsed.answer;
+        if (Array.isArray(parsed.recommendations)) {
+          output.recommendations = parsed.recommendations;
+        }
+      }
+
+      return output;
+    }
+  } catch (err) {
+    console.error("Failed to parse Gemini response:", err.message);
+  }
+
+  return output;
+}
+
+
+
+
+
+
+let customChain;
+
+// Load documents, initialize retriever and build chain
+(async () => {
+  try {
+    const documents = await loadAndSplitData();
+    const retriever = new CustomRetriever(documents, embedText);
+    await retriever.initialize();
+    customChain = createCustomChain(retriever);
+    console.log("Chain initialized successfully");
+  } catch (error) {
+    console.error("Error initializing chain:", error);
+  }
+})();
+
+// Routes
+app.post('/chat/:userId', async (req, res) => {
+  const { userId } = req.params;
+  const { query, chat_history = [], sessionId } = req.body;
+  
+  if (!query) return res.status(400).json({ error: 'Query is required' });
+  if (!sessionId) return res.status(400).json({ error: 'Session ID is required' });
+
+  try {
+    // Get chat history from database if userId is provided and valid
+    let formattedHistory = [];
+    
+    if (userId && isValidObjectId(userId)) {
+      // If chat_history is not provided in request, fetch from database
+      if (!chat_history || chat_history.length === 0) {
+        const dbHistory = await getUserChatHistory(userId, sessionId);
+        if (dbHistory && dbHistory.messages) {
+          formattedHistory = dbHistory.messages.flatMap((msg) => [
+            new HumanMessage({ content: msg.question }),
+            new AIMessage({ content: msg.answer }),
+          ]);
+        }
+      } else {
+        formattedHistory = chat_history.flatMap((msg) => [
+          new HumanMessage({ content: msg.question }),
+          new AIMessage({ content: msg.answer }),
+        ]);
+      }
+    } else {
+      // Use chat history from request if userId is not valid
+      formattedHistory = chat_history.flatMap((msg) => [
+        new HumanMessage({ content: msg.question }),
+        new AIMessage({ content: msg.answer }),
+      ]);
+    }
+
+    const response = await customChain({
+      question: query,
+      chat_history: formattedHistory,
+    });
+
+    const { answer, recommendations } = parseResponse(response);
+
+    // Save to database if userId is valid
+    if (userId && isValidObjectId(userId)) {
+      await saveChatToHistory(userId, query, sessionId, answer, recommendations);
+    }
+
+    res.json({ 
+      response: answer,
+      recommendations: recommendations 
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Something went wrong', details: error.message });
+  }
+});
+
+const PORT_TO_USE = 5001;
+app.listen(PORT_TO_USE, '0.0.0.0', () => {
+  console.log(`Server listening on port ${PORT_TO_USE}`);
+});

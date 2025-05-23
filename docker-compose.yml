@@ -1,0 +1,31 @@
+
+# version: '3.8'
+
+# services:
+#   chromadb:
+#     image: chromadb/chroma
+#     volumes:
+#       - ./chroma-data:/data
+#     ports:
+#       - "8000:8000"
+#     restart: unless-stopped
+#     environment:
+#       - ALLOW_RESET=true
+#       - ANONYMIZED_TELEMETRY=false
+
+#   app:
+#     build:
+#       context: .
+#       dockerfile: Dockerfile
+#     ports:
+#       - "5005:5005"
+#     volumes:
+#       - .:/usr/src/app
+#       - ./newData.txt:/usr/src/app/newData.txt
+#     restart: unless-stopped
+#     depends_on:
+#       - chromadb
+#     environment:
+#       - GEMINI_API_KEY=AIzaSyCvrwOcLZkssWRpvPU1T7qsk6E0ZKG-iLM
+#       - PORT=5005
+#       - CHROMA_HOST=chromadb

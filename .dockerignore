@@ -1,0 +1,19 @@
+# Node dependencies
+node_modules
+npm-debug.log
+yarn-debug.log
+yarn-error.log
+
+# Git and OS files
+.git
+.gitignore
+.DS_Store
+
+
+# Build and secrets
+Dockerfile
+key
+
+# Misc
+*.md
+`package-lock.json`
