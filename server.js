@@ -12,7 +12,6 @@ import connectToDatabase, { userChatCollection } from './database.js';
 import { analyzeSensitiveContent } from './tracksensetiveword.js';
 import AIchatbot from "./Model/chathistory.js"
 
-// Validate MongoDB ObjectId
 function isValidObjectId(id) {
   try {
     return ObjectId.isValid(id);
