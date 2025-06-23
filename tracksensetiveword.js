@@ -4,7 +4,9 @@ import dotenv from "dotenv";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import AIchatbot from "./Model/chathistory.js"
+import AIchatbot from "./Model/chathistory.js";
+import Keyword from "./Model/KeyWordSchema.js";
+
 // Setup environment and paths
 dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
@@ -13,6 +15,7 @@ const sensitiveWordsFilePath = path.join(__dirname, "sensitive.json");
 
 // Initialize cache and database connection
 const cache = new NodeCache({ stdTTL: 600 });
+
 /**
  * Loads sensitive words from JSON file
  * @param {string} filePath Path to the sensitive words JSON file
@@ -42,84 +45,10 @@ function loadSensitiveWordsFromFile(filePath) {
     return {};
   }
 }
+
 const sensitiveWords = loadSensitiveWordsFromFile(sensitiveWordsFilePath);
-const keyWords = [
-  "afraid",
-  "angry",
-  "anger",
-  "anxious",
-  "anxiety",
-  "burnout",
-  "calm",
-  "confident",
-  "confused",
-  "depressed",
-  "depression",
-  "low energy",
-  "drained",
-  "fear",
-  "frustrated",
-  "frustration",
-  "help",
-  "helpless",
-  "hopeless",
-  "feeling low",
-  "numb",
-  "panic",
-  "overwhelmed",
-  "sad",
-  "stress",
-  "stressed",
-  "tired",
-  "exhausted",
-  "exam stress",
-  "sleep trouble",
-  "focusing",
-  "blank out",
-  "self-worth",
-  "disappontment",
-  "letting down",
-  "family",
-  "coping",
-  "failure",
-  "procrastination",
-  "body image",
-  "peer pressure",
-  "identity",
-  "sexuality",
-  "bullying",
-  "breakup",
-  "body image",
-  "social anxiety",
-  "guilt",
-  "loneliness",
-  "self-doubt",
-  "substance abuse",
-  "trauma",
-  "time management",
-  "self-care",
-  "parental presuure",
-  "FOMO",
-  "social media",
-  "relationship",
-  "career uncertainty",
-  "financial pressure",
-  "learning difficulty",
-  "drugs",
-  "alcohol",
-  "therapy",
-  "counselling",
-  "tension",
-  "partying",
-  "misunderstanding",
-  "expectation",
-  "money issue",
-  "lack of motivation",
-  "career uncertainty",
-  "bored",
-  "work pressure",
-  "work stress",
-];
+
+// Fallback keywords (kept for backward compatibility)
 const defaultKeyWords = [
   "afraid",
   "angry",
@@ -136,7 +65,7 @@ const defaultKeyWords = [
   "drained",
   "fear",
   "frustrated",
-  "frustration"
+  "frustration",
 ];
 
 // Fallback sensitive words in case file is not available or empty
@@ -229,7 +158,6 @@ function calculateSeverity(matches) {
  * @param {string} sensitiveWord Sensitive word category to track
  * @returns {Promise<void>}
  */
-
 const trackSensitiveWord = async (userId, sensitiveWord) => {
   try {
     if (!userId || !ObjectId.isValid(userId)) {
@@ -276,7 +204,7 @@ const trackSensitiveWord = async (userId, sensitiveWord) => {
         userId: objectId,
         chat_history: [],
         sensitiveWords: [{ word: sensitiveWord, count: 1 }],
-        keyWords: []
+        keyWords: [],
       });
       await newChatbot.save();
     }
@@ -286,65 +214,231 @@ const trackSensitiveWord = async (userId, sensitiveWord) => {
   }
 };
 
-const trackKeyWord = async (userId, keyWord) => {
+/**
+ * Tracks keywords from the Keyword collection and updates their selectionCount
+ * @param {string} text The text to analyze for keywords
+ * @returns {Promise<Array>} Array of matched keywords with their details
+ */
+const trackKeyWord = async (text) => {
+  try {
+    if (!text || typeof text !== "string") {
+      console.error("Invalid text for tracking keywords");
+      return [];
+    }
+
+    const textLower = text.toLowerCase();
+    const matchedKeywords = [];
+
+    // Fetch all keywords from the Keyword collection
+    const keywords = await Keyword.find({});
+
+    if (!keywords || keywords.length === 0) {
+      console.log("No keywords found in the collection");
+      return [];
+    }
+
+    // Check each keyword against the text
+    for (const keyword of keywords) {
+      let isMatched = false;
+      const keywordDetails = {
+        _id: keyword._id,
+        keywordId: keyword.keywordId,
+        name: keyword.name, // This is a Map object
+        matchedTerms: [],
+      };
+
+      // Check all language variants of the keyword
+      for (const [lang, term] of keyword.name.entries()) {
+        if (term && textLower.includes(term.toLowerCase())) {
+          isMatched = true;
+          keywordDetails.matchedTerms.push({
+            language: lang,
+            term: term,
+          });
+        }
+      }
+
+      // If keyword is matched, update its global selectionCount
+      if (isMatched) {
+        await Keyword.updateOne(
+          { _id: keyword._id },
+          {
+            $inc: { selectionCount: 1 },
+            $set: { lastSelectedAt: new Date() },
+          }
+        );
+
+        matchedKeywords.push(keywordDetails);
+
+        if (process.env.NODE_ENV === "development") {
+          console.log(
+            `Keyword matched: ${keyword.keywordId} - ${JSON.stringify(
+              keywordDetails.matchedTerms
+            )}`
+          );
+        }
+      }
+    }
+
+    return matchedKeywords;
+  } catch (error) {
+    console.error("Error tracking keywords:", error);
+    return [];
+  }
+};
+
+// it is used to track keywords from the Keyword collection not updating here
+
+const trackKeyWords = async (text) => {
+  try {
+    if (!text || typeof text !== "string") {
+      console.error("Invalid text for tracking keywords");
+      return [];
+    }
+
+    const textLower = text.toLowerCase();
+    const matchedKeywords = [];
+
+    // Fetch all keywords from the Keyword collection
+    const keywords = await Keyword.find({});
+
+    if (!keywords || keywords.length === 0) {
+      console.log("No keywords found in the collection");
+      return [];
+    }
+
+    // Check each keyword against the text
+    for (const keyword of keywords) {
+      let isMatched = false;
+      const keywordDetails = {
+        _id: keyword._id,
+        keywordId: keyword.keywordId,
+        name: keyword.name, // This is a Map object
+        matchedTerms: [],
+      };
+
+      // Check all language variants of the keyword
+      for (const [lang, term] of keyword.name.entries()) {
+        if (term && textLower.includes(term.toLowerCase())) {
+          isMatched = true;
+          keywordDetails.matchedTerms.push({
+            language: lang,
+            term: term,
+          });
+        }
+      }
+      if (isMatched) {
+        matchedKeywords.push(keywordDetails);
+        if (process.env.NODE_ENV === "development") {
+          console.log(
+            `Keyword matched: ${keyword.keywordId} - ${JSON.stringify(
+              keywordDetails.matchedTerms
+            )}`
+          );
+        }
+      }
+    }
+
+    return matchedKeywords;
+  } catch (error) {
+    console.error("Error tracking keywords:", error);
+    return [];
+  }
+};
+/**
+ * Tracks keywords for a specific user in the chatbot collection
+ * @param {string} userId User's ID
+ * @param {Array} matchedKeywords Array of matched keywords from the Keyword collection
+ * @returns {Promise<void>}
+ */
+const trackUserKeyWords = async (userId, matchedKeywords) => {
   try {
     if (!userId || !ObjectId.isValid(userId)) {
-      console.error("Invalid userId for tracking keyword");
+      console.error("Invalid userId for tracking user keywords");
+      return;
+    }
+
+    if (!matchedKeywords || matchedKeywords.length === 0) {
       return;
     }
 
     const objectId = new ObjectId(userId);
 
     // Find the user document
-    const user = await AIchatbot.findOne({ userId: objectId });
+    let user = await AIchatbot.findOne({ userId: objectId });
 
-    if (user) {
-      // Check if keyWords array exists
-      if (user.keyWords && Array.isArray(user.keyWords)) {
-        // If user exists, check if the keyword is already tracked
-        const keyWordIndex = user.keyWords.findIndex(
-          (item) => item.word === keyWord
-        );
-
-        if (keyWordIndex >= 0) {
-          // Increment count if word exists
-          await AIchatbot.updateOne(
-            { userId: objectId, "keyWords.word": keyWord },
-            { $inc: { "keyWords.$.count": 1 } }
-          );
-        } else {
-          // Add new word with count 1
-          await AIchatbot.updateOne(
-            { userId: objectId },
-            { $push: { keyWords: { word: keyWord, count: 1 } } }
-          );
-        }
-      } else {
-        // User exists but doesn't have keyWords array yet
-        await AIchatbot.updateOne(
-          { userId: objectId },
-          { $set: { keyWords: [{ word: keyWord, count: 1 }] } }
-        );
-      }
-    } else {
-      // Create new user document with the keyword
-      const newChatbot = new AIchatbot({
+    if (!user) {
+      // Create new user document
+      user = new AIchatbot({
         userId: objectId,
         chat_history: [],
-        keyWords: [{ word: keyWord, count: 1 }],
-        sensitiveWords: []
+        keyWords: [],
+        sensitiveWords: [],
       });
-      await newChatbot.save();
+      await user.save();
+    }
+
+    // Process each matched keyword
+    for (const matchedKeyword of matchedKeywords) {
+      // Use _id instead of keywordId since you want to store ObjectId
+      const { _id, keywordId, name } = matchedKeyword;
+
+      // Check if this keyword is already tracked for the user
+      // Compare using _id (ObjectId) instead of keywordId (string)
+      const existingKeywordIndex = user.keyWords.findIndex(
+        (item) => item.keywordId.toString() === _id.toString()
+      );
+
+      if (existingKeywordIndex >= 0) {
+        // Increment count if keyword exists
+        await AIchatbot.updateOne(
+          { userId: objectId, "keyWords.keywordId": _id },
+          {
+            $inc: { "keyWords.$.count": 1 },
+            $set: { "keyWords.$.lastSelectedAt": new Date() },
+          }
+        );
+      } else {
+        // Add new keyword entry
+        const newKeywordEntry = {
+          _id: new ObjectId(),
+          keywordId: _id, // Store the ObjectId from the keyword document
+          name: name, // Store the complete Map object
+          count: 1,
+          lastSelectedAt: new Date(),
+        };
+
+        await AIchatbot.updateOne(
+          { userId: objectId },
+          {
+            $push: {
+              keyWords: newKeywordEntry,
+            },
+          }
+        );
+      }
+
+      if (process.env.NODE_ENV === "development") {
+        console.log(
+          `Tracked keyword for user ${userId}: ${keywordId} (ObjectId: ${_id})`
+        );
+      }
     }
   } catch (error) {
-    console.error("Error tracking keyword:", error);
+    console.error("Error tracking user keywords:", error);
     // Don't throw to prevent disrupting the main flow
   }
 };
 
+/**
+ * Legacy function to track keywords in user's chat history (kept for backward compatibility)
+ * @param {string} userId User's ID
+ * @param {string} keyWord Keyword to track in user's history
+ * @returns {Promise<void>}
+ */
 
 /**
- * Analyzes text for sensitive content
+ * Analyzes text for sensitive content and keywords
  * @param {string} userId User's ID
  * @param {string} text Text to analyze
  * @returns {Promise<Object>} Analysis results
@@ -359,6 +453,7 @@ async function analyzeSensitiveContent(userId, text) {
         hasSensitiveContent: false,
         categoriesWithMatches: [],
         severity: "none",
+        matchedKeywords: [],
       };
     }
 
@@ -369,6 +464,7 @@ async function analyzeSensitiveContent(userId, text) {
         hasSensitiveContent: false,
         categoriesWithMatches: [],
         severity: "none",
+        matchedKeywords: [],
       };
     }
 
@@ -378,14 +474,11 @@ async function analyzeSensitiveContent(userId, text) {
         ? sensitiveWords
         : defaultSensitiveWords;
 
-    const keyWordsToUse =
-      keyWords.length > 0 ? keyWords : defaultKeyWords;
-
     const textLower = text.toLowerCase();
     const matches = {};
     let hasSensitiveContent = false;
 
-    // Find matches across all categories
+    // Find matches across all sensitive word categories
     Object.keys(wordsToUse).forEach((category) => {
       const matchedWords = wordsToUse[category].filter((word) =>
         textLower.includes(word.toLowerCase())
@@ -397,10 +490,8 @@ async function analyzeSensitiveContent(userId, text) {
       }
     });
 
-    // Find matches for keywords
-    const matchedKeyWords = keyWordsToUse.filter((word) =>
-      textLower.includes(word.toLowerCase())
-    );
+    // Track keywords from the Keyword collection
+    const matchedKeywords = await trackKeyWord(text);
 
     const categoriesWithMatches = Object.keys(matches); // Categories with matches
 
@@ -409,14 +500,12 @@ async function analyzeSensitiveContent(userId, text) {
       const sensitivePromises = categoriesWithMatches.map((category) =>
         trackSensitiveWord(userId, category)
       );
-      
-      // Track individual keywords
-      const keywordPromises = matchedKeyWords.map((keyword) =>
-        trackKeyWord(userId, keyword)
-      );
-      
+
+      // Track keywords for the specific user
+      await trackUserKeyWords(userId, matchedKeywords);
+
       // Wait for all tracking operations to complete
-      await Promise.all([...sensitivePromises, ...keywordPromises]);
+      await Promise.all(sensitivePromises);
     } catch (error) {
       console.error("Error tracking words:", error);
     }
@@ -427,7 +516,7 @@ async function analyzeSensitiveContent(userId, text) {
     if (process.env.NODE_ENV === "development") {
       console.log("matches:", matches);
       console.log("categoriesWithMatches:", categoriesWithMatches);
-      console.log("matchedKeyWords:", matchedKeyWords);
+      console.log("matchedKeywords:", matchedKeywords);
       console.log("severity:", severity);
     }
 
@@ -435,7 +524,7 @@ async function analyzeSensitiveContent(userId, text) {
       matches,
       hasSensitiveContent,
       categoriesWithMatches,
-      matchedKeyWords, // Include matched keywords in the response
+      matchedKeywords, // Include matched keywords from the collection
       severity,
     };
   } catch (error) {
@@ -445,11 +534,16 @@ async function analyzeSensitiveContent(userId, text) {
       matches: {},
       hasSensitiveContent: false,
       categoriesWithMatches: [],
-      matchedKeyWords: [],
+      matchedKeywords: [],
       severity: "none",
       error: error.message,
     };
   }
 }
 
-export { analyzeSensitiveContent };
+export {
+  analyzeSensitiveContent,
+  trackKeyWord,
+  trackUserKeyWords,
+  trackKeyWords,
+};
