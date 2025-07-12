@@ -27,6 +27,13 @@ const SensitiveWordSchema = new mongoose.Schema({
     type: Number,
     default: 1,
   },
+  // Array to store timestamps of occurrences
+  occurrences: [
+    {
+      type: Date,
+      default: Date.now,
+    },
+  ],
 });
 
 // Define chat message schema

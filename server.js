@@ -5,6 +5,7 @@ import { CharacterTextSplitter } from "langchain/text_splitter";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { HumanMessage, AIMessage } from "@langchain/core/messages";
 import cors from "cors";
+import moment from "moment";
 import bodyParser from "body-parser";
 import cookieParser from "cookie-parser";
 import { ObjectId } from "mongodb";
@@ -17,6 +18,7 @@ import AIchatbot from "./Model/chathistory.js";
 import Content from "./Model/ContentSchema.js";
 import recommendContentByKeywords from "./Recommendation.js";
 import { translateWithAWS } from "./TranslateAWS.js";
+import counter from "./Model/counter.js";
 
 function isValidObjectId(id) {
   try {
@@ -46,7 +48,6 @@ app.use(bodyParser.json({ extended: true }));
 app.use(bodyParser.urlencoded({ extended: true }));
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const PORT = process.env.PORT_TO_USE || 5001;
-console.log(process.env.PORT_TO_USE, "port number");
 
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 const geminiModel = genAI.getGenerativeModel({ model: "gemini-1.5-pro" });
@@ -99,10 +100,6 @@ async function saveChatToHistory(
     );
 
     if (updateResult.matchedCount > 0) {
-      console.log(
-        `Chat added to existing session ${sessionId} for user ${userId}`
-      );
-
       // Process sensitive words
       const sensitiveWordsFound = await analyzeSensitiveContent(userId, query);
 
@@ -130,8 +127,6 @@ async function saveChatToHistory(
         new: true,
       }
     );
-
-    console.log(`New session ${sessionId} created for user ${userId}`);
 
     // Process sensitive words
     const sensitiveWordsFound = await analyzeSensitiveContent(userId, query);
@@ -287,10 +282,6 @@ class CustomRetriever {
   }
 
   async initialize() {
-    // Precompute embeddings for all documents
-    console.log(
-      `Starting embedding computation for ${this.documents.length} documents...`
-    );
     let successCount = 0;
     let errorCount = 0;
 
@@ -312,7 +303,6 @@ class CustomRetriever {
           });
 
           const subChunks = await splitter.splitText(pageContent);
-          // console.log(`  Split large document into ${subChunks.length} sub-chunks`);
 
           // Process each sub-chunk individually
           for (const chunk of subChunks) {
@@ -336,13 +326,13 @@ class CustomRetriever {
         }
 
         // Log progress periodically
-        if ((successCount + errorCount) % 10 === 0) {
-          console.log(
-            `Processed ${successCount + errorCount}/${
-              this.documents.length
-            } documents. Success: ${successCount}, Errors: ${errorCount}`
-          );
-        }
+        // if ((successCount + errorCount) % 10 === 0) {
+        //   console.log(
+        //     `Processed ${successCount + errorCount}/${
+        //       this.documents.length
+        //     } documents. Success: ${successCount}, Errors: ${errorCount}`
+        //   );
+        // }
       } catch (error) {
         console.error(`Failed to embed document: ${error.message}`);
         errorCount++;
@@ -573,12 +563,22 @@ app.post("/chat/:userId", async (req, res) => {
       );
     }
 
+    await counter.findOneAndUpdate(
+      { entity: "Success" },
+      { $inc: { count: 1 } },
+      { new: true, upsert: true }
+    );
     res.json({
       response: answer,
       recommendations: recommendations,
       keywords: keywords.map((item) => item._id) || [],
     });
   } catch (error) {
+    await counter.findOneAndUpdate(
+      { entity: "Failure" },
+      { $inc: { count: 1 } },
+      { new: true, upsert: true }
+    );
     console.error(error);
     res
       .status(500)
@@ -725,6 +725,102 @@ app.post("/translate", async (req, res) => {
       success: false,
       error: "Internal server error during translation",
       message: error.message,
+    });
+  }
+});
+
+app.get("/sensitvecount", async (req, res) => {
+  try {
+    const { start, end, granularity } = req.query;
+
+    if (!start || !end) {
+      return res.status(400).json({
+        response: "failed",
+        message: "Missing required params: start, end",
+      });
+    }
+
+    const startDate = new Date(start);
+    const endDate = new Date(end);
+    const diffDays = Math.ceil((endDate - startDate) / (24 * 60 * 60 * 1000));
+
+    const cleanGranularity = granularity?.trim();
+    const validGranularities = ["hour", "day", "week", "month", "year"];
+    let bucket = validGranularities.includes(cleanGranularity)
+      ? cleanGranularity
+      : null;
+
+    if (!bucket) {
+      if (diffDays <= 30) bucket = "day";
+      else if (diffDays <= 120) bucket = "week";
+      else if (diffDays <= 730) bucket = "month";
+      else bucket = "year";
+    }
+
+    const bucketFormat = {
+      hour: "YYYY-MM-DD HH:00",
+      day: "YYYY-MM-DD",
+      week: "GGGG-ww",
+      month: "YYYY-MM",
+      year: "YYYY",
+    }[bucket];
+
+    const allDocs = await AIchatbot.find({
+      "sensitiveWords.occurrences": { $exists: true, $ne: [] },
+    });
+
+    const bucketCounts = {};
+
+    for (const doc of allDocs) {
+      for (const sw of doc.sensitiveWords || []) {
+        for (const ts of sw.occurrences || []) {
+          const tsDate = new Date(ts);
+          if (tsDate >= startDate && tsDate < endDate) {
+            const key = moment(tsDate).format(bucketFormat);
+            bucketCounts[key] = (bucketCounts[key] || 0) + 1;
+          }
+        }
+      }
+    }
+
+    const labels = [];
+    const endMoment = moment(endDate);
+    let cur = moment(startDate);
+    while (cur.isBefore(endMoment)) {
+      let label;
+      if (bucket === "hour") {
+        label = cur.format("YYYY-MM-DD HH:00");
+        cur.add(1, "hour");
+      } else if (bucket === "day") {
+        label = cur.format("YYYY-MM-DD");
+        cur.add(1, "day");
+      } else if (bucket === "week") {
+        label = cur.format("GGGG-ww");
+        cur.add(1, "week");
+      } else if (bucket === "month") {
+        label = cur.format("YYYY-MM");
+        cur.add(1, "month");
+      } else {
+        label = cur.format("YYYY");
+        cur.add(1, "year");
+      }
+      labels.push(label);
+    }
+
+    const chartData = labels.map((label) => bucketCounts[label] || 0);
+
+    return res.status(200).json({
+      response: "success",
+      granularity: bucket,
+      labels,
+      series: [{ name: "Total Sensitive Word Occurrences", data: chartData }],
+    });
+  } catch (err) {
+    console.error("Error fetching total sensitive word occurrences:", err);
+    return res.status(500).json({
+      response: "failed",
+      message: "Internal server error while fetching sensitive word data",
+      err: err.message,
     });
   }
 });

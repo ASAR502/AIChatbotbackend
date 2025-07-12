@@ -164,8 +164,8 @@ const trackSensitiveWord = async (userId, sensitiveWord) => {
       console.error("Invalid userId for tracking sensitive word");
       return;
     }
-
     const objectId = new ObjectId(userId);
+    const currentTimestamp = new Date();
 
     // Find the user document
     const user = await AIchatbot.findOne({ userId: objectId });
@@ -179,23 +179,46 @@ const trackSensitiveWord = async (userId, sensitiveWord) => {
         );
 
         if (sensitiveWordIndex >= 0) {
-          // Increment count if word exists
+          // Update count and add new occurrence timestamp
           await AIchatbot.updateOne(
             { userId: objectId, "sensitiveWords.word": sensitiveWord },
-            { $inc: { "sensitiveWords.$.count": 1 } }
+            {
+              $inc: { "sensitiveWords.$.count": 1 },
+              $push: {
+                "sensitiveWords.$.occurrences": currentTimestamp,
+              },
+            }
           );
         } else {
-          // Add new word with count 1
+          // Add new word with count 1 and first occurrence timestamp
           await AIchatbot.updateOne(
             { userId: objectId },
-            { $push: { sensitiveWords: { word: sensitiveWord, count: 1 } } }
+            {
+              $push: {
+                sensitiveWords: {
+                  word: sensitiveWord,
+                  count: 1,
+                  occurrences: [currentTimestamp],
+                },
+              },
+            }
           );
         }
       } else {
         // User exists but doesn't have sensitiveWords array yet
         await AIchatbot.updateOne(
           { userId: objectId },
-          { $set: { sensitiveWords: [{ word: sensitiveWord, count: 1 }] } }
+          {
+            $set: {
+              sensitiveWords: [
+                {
+                  word: sensitiveWord,
+                  count: 1,
+                  occurrences: [currentTimestamp],
+                },
+              ],
+            },
+          }
         );
       }
     } else {
@@ -203,7 +226,13 @@ const trackSensitiveWord = async (userId, sensitiveWord) => {
       const newChatbot = new AIchatbot({
         userId: objectId,
         chat_history: [],
-        sensitiveWords: [{ word: sensitiveWord, count: 1 }],
+        sensitiveWords: [
+          {
+            word: sensitiveWord,
+            count: 1,
+            occurrences: [currentTimestamp],
+          },
+        ],
         keyWords: [],
       });
       await newChatbot.save();
@@ -213,7 +242,6 @@ const trackSensitiveWord = async (userId, sensitiveWord) => {
     // Don't throw to prevent disrupting the main flow
   }
 };
-
 /**
  * Tracks keywords from the Keyword collection and updates their selectionCount
  * @param {string} text The text to analyze for keywords
